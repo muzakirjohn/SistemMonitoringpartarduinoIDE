@@ -1,0 +1,314 @@
+#include <PZEM004Tv30.h>
+PZEM004Tv30 pzem(5, 4);
+#include <ESP8266WiFi.h>
+#include <Arduino.h>
+#if defined(ESP32) || defined(PICO_RP2040)
+#include <WiFi.h>
+#elif defined(ESP8266)
+#include <ESP8266WiFi.h>
+#endif
+#include "time.h"
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <Firebase_ESP_Client.h>
+#define EN 12
+ 
+
+// Provide the token generation process info.
+#include <addons/TokenHelper.h>
+
+/* 1. Define the WiFi credentials */
+#define WIFI_SSID "SITIAISYAH"
+#define WIFI_PASSWORD "bismillah99"
+
+/* 2. Define the API Key */
+#define API_KEY "AIzaSyD0JpzqDrOp3ZB9OkNXVCsOemp6KPY590Q"
+
+/* 3. Define the project ID */
+#define FIREBASE_PROJECT_ID "monitoringlistrik-a81d8"
+
+/* 4. Define the user Email and password that alreadey registerd or added in your project */
+#define USER_EMAIL "ahmad.muzakir@ugm.ac.id"
+#define USER_PASSWORD "Adadeh123"
+
+// Define Firebase Data object
+FirebaseData fbdo;
+
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long dataMillis = 0;
+int count = 0;
+int JumlahPerangkat;
+ 
+String weekDays[7]={"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+
+//Month names
+String months[12]={"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
+
+// Define NTP Client to get time
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org");
+
+
+#if defined(ARDUINO_RASPBERRY_PI_PxICO_W)
+WiFiMulti multi;
+#endif
+
+void fcsUploadCallback(CFS_UploadStatusInfo info)
+{
+    if (info.status == fb_esp_cfs_upload_status_init)
+    {
+        Serial.printf("\nUploading data (%d)...\n", info.size);
+    }
+    else if (info.status == fb_esp_cfs_upload_status_upload)
+    {
+        Serial.printf("Uploaded %d%s\n", (int)info.progress, "%");
+    }
+    else if (info.status == fb_esp_cfs_upload_status_complete)
+    {
+        Serial.println("Upload completed ");
+    }
+    else if (info.status == fb_esp_cfs_upload_status_process_response)
+    {
+        Serial.print("Processing the response... ");
+    }
+    else if (info.status == fb_esp_cfs_upload_status_error)
+    {
+        Serial.printf("Upload failed, %s\n", info.errorMsg.c_str());
+    }
+}
+
+void setup()
+{
+
+    Serial.begin(9600);
+  
+#if defined(ARDUINO_RASPBERRY_PI_PICO_W)
+    multi.addAP(WIFI_SSID, WIFI_PASSWORD);
+    multi.run();
+#else
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#endif
+
+    Serial.print("Connecting to Wi-Fi");
+    unsigned long ms = millis();
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.print(".");
+        delay(300);
+#if defined(ARDUINO_RASPBERRY_PI_PICO_W)
+        if (millis() - ms > 10000)
+            break;
+#endif
+    }
+    Serial.println();
+    Serial.print("Connected with IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.println();
+
+    Serial.printf("Firebase Client v%s\n\n", FIREBASE_CLIENT_VERSION);
+
+    /* Assign the api key (required) */
+    config.api_key = API_KEY;
+
+    /* Assign the user sign in credentials */
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+
+    // The WiFi credentials are required for Pico W
+    // due to it does not have reconnect feature.
+#if defined(ARDUINO_RASPBERRY_PI_PICO_W)
+    config.wifi.clearAP();
+    config.wifi.addAP(WIFI_SSID, WIFI_PASSWORD);
+#endif
+
+    /* Assign the callback function for the long running token generation task */
+    config.token_status_callback = tokenStatusCallback; // see addons/TokenHelper.h
+
+#if defined(ESP8266)
+    // In ESP8266 required for BearSSL rx/tx buffer for large data handle, increase Rx size as needed.
+    fbdo.setBSSLBufferSize(2048 /* Rx buffer size in bytes from 512 - 16384 */, 2048 /* Tx buffer size in bytes from 512 - 16384 */);
+#endif
+
+    // Limit the size of response payload to be collected in FirebaseData
+    fbdo.setResponseSize(2048);
+
+    Firebase.begin(&config, &auth);
+
+    Firebase.reconnectWiFi(true);
+// Initialize a NTPClient to get time
+  timeClient.begin();
+  // Set offset time in seconds to adjust for your timezone, for example:
+  // GMT +1 = 3600
+  // GMT +8 = 28800
+  // GMT -1 = -3600
+  // GMT 0 = 0
+  timeClient.setTimeOffset(0);
+}
+
+
+
+void getRandomStr(char* output, int len){
+    char* eligible_chars = "AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz1234567890";
+    for(int i = 0; i< len; i++){
+        uint8_t random_index = random(0, strlen(eligible_chars));
+        output[i] = eligible_chars[random_index];
+    }
+    Serial.print("output: "); Serial.println(output);
+}
+
+void loop()
+{
+   
+    // Firebase.ready() should be called repeatedly to handle authentication tasks.
+
+    if (Firebase.ready() && (millis() - dataMillis > 10000 || dataMillis == 0))
+    {
+        dataMillis = millis();
+
+        // For the usage of FirebaseJson, see examples/FirebaseJson/BasicUsage/Create.ino
+        FirebaseJson content;
+        
+        char iv_str[17] = {0}; //The last '\0' helps terminate the string
+        getRandomStr(iv_str, 16);
+        // We will create the nested document in the parent path "a0/b0/c0
+        // a0 is the collection id, b0 is the document id in collection a0 and c0 is the collection id in the document b0.
+        // and d? is the document id in the document collection id c0 which we will create.
+        String documentPath = "DataFIXMonitoring/d" + String (iv_str);
+        String documentTotalday = "TotalEnergy/d";
+        // If the document path contains space e.g. "a b c/d e f"
+        // It should encode the space as %20 then the path will be "a%20b%20c/d%20e%20f"
+
+        
+        float power = pzem.power();
+            if( !isnan(power) ){
+                Serial.print("Power: "); Serial.print(power); Serial.println("W");
+                 content.set("fields/power/doubleValue", power);
+            } else {
+                Serial.println("Error reading power");
+          }
+
+         
+          if(power == 0){
+            Serial.println("Perangkat tidak terhubung");
+            JumlahPerangkat = 0;
+            content.set("fields/JumlahPerangkat/doubleValue",JumlahPerangkat);
+            }
+          else if(power >=1 && power<150){
+            Serial.println("Perangkat terhubung 1");
+            JumlahPerangkat = 1;
+            content.set("fields/JumlahPerangkat/doubleValue",JumlahPerangkat);
+            }
+          else if(power >=150 && power<300){
+            Serial.println("Perangkat terhubung 2");
+            JumlahPerangkat = 2;
+            content.set("fields/JumlahPerangkat/doubleValue",JumlahPerangkat);
+            }
+          else if(power >=300) {
+            Serial.println("Perangkat terhubung 3");
+            JumlahPerangkat = 3;
+            content.set("fields/JumlahPerangkat/doubleValue",JumlahPerangkat);
+            }
+
+
+     float Tegangan = pzem.voltage();
+            if( !isnan(frequency) ){
+                Serial.print("Tegangan: "); Serial.print(Tegangan, 1); Serial.println("V");
+                content.set("fields/Tegangan/doubleValue", Tegangan);
+            } else {
+                Serial.println("Error reading frequency");
+            }
+     
+     float Arus = pzem.current();
+            if( !isnan(frequency) ){
+                Serial.print("Arus: "); Serial.print(Arus, 1); Serial.println("V");
+                content.set("fields/Arus/doubleValue", Arus);
+            } else {
+                Serial.println("Error reading frequency");
+            }
+     
+            
+        float energy = pzem.energy();
+            if( !isnan(energy) ){
+                
+                Serial.print("Energy: "); Serial.print(energy,3); Serial.println("kWh");
+                 content.set("fields/energy/doubleValue", energy);
+            } else {
+                Serial.println("Error reading energy");
+            }
+
+
+        
+         
+        float frequency = pzem.frequency();
+            if( !isnan(frequency) ){
+                Serial.print("Frequency: "); Serial.print(frequency, 1); Serial.println("Hz");
+                content.set("fields/frequency/doubleValue", frequency);
+            } else {
+                Serial.println("Error reading frequency");
+            }
+        
+        float pf = pzem.pf();
+            if( !isnan(pf) ){
+                Serial.print("PF: "); Serial.println(pf);
+                content.set("fields/PF/doubleValue", pf);
+            } else {
+                Serial.println("Error reading power factor");
+            }
+         
+      timeClient.update();
+    
+      time_t epochTime = timeClient.getEpochTime();
+     
+      String formattedTime = timeClient.getFormattedTime();
+        if( formattedTime >="17:00:00"&&formattedTime <"17:03:00"){
+        pzem.resetEnergy();  
+        }
+       if(formattedTime >="16.:59:00"&&formattedTime <"17:00 :00"){
+       Serial.print("Total Energy: "); Serial.print(energy,3); Serial.println("kWh");
+       content.set("fields/TotalEnergyDay/doubleValue", energy);
+       }  
+      Serial.print("Formatted Time: ");
+      Serial.println(formattedTime);  
+    
+    
+      String weekDay = weekDays[timeClient.getDay()];
+       
+      int Harga_listrik = energy*1352;
+      Serial.print("Harga listrik: RP. ");
+      Serial.println(Harga_listrik);
+      content.set("fields/HargaListrik/doubleValue",+Harga_listrik);
+    
+      //Get a time structure
+      struct tm *ptm = gmtime ((time_t *)&epochTime); 
+    
+      int monthDay = ptm->tm_mday;
+      
+      int currentMonth = ptm->tm_mon+1;
+    
+      String currentMonthName = months[currentMonth-1];
+     
+    
+      int currentYear = ptm->tm_year+1900;
+    
+      String currentDate = String(currentYear) + "-" + String(currentMonth) + "-" + String(monthDay);
+    
+     Serial.println("");
+      content.set("fields/TimeStamp/timestampValue", currentDate+"T"+formattedTime+"Z");
+            count++;
+    
+            Serial.print("Create a document... ");
+    
+            if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "" /* databaseId can be (default) or empty */, documentPath.c_str(), content.raw()))
+                Serial.println("Terhubung dengan Firebase");
+            else
+                Serial.println(fbdo.errorReason());
+        
+
+    }
+
+  delay(9000);
+
+  
+}
